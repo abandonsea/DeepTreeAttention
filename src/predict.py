@@ -3,15 +3,15 @@ from deepforest import main
 from deepforest.utilities import annotations_to_shapefile
 import glob
 import geopandas as gpd
+import numpy as np
+import os
 import rasterio
 from src.main import TreeModel
 from src.models import dead
-from src import data 
+from src.utils import preprocess_image
+from src.CHM import postprocess_CHM
 from torch.utils.data import Dataset
-import os
-import numpy as np
 from torchvision import transforms
-from torch.nn import functional as F
 import torch
 from torch.utils.data.dataloader import default_collate
 
@@ -64,7 +64,7 @@ class on_the_fly_dataset(Dataset):
             if crop.size == 0:
                 return individual, None
             
-            image = data.preprocess_image(crop, channel_is_first=True)
+            image = preprocess_image(crop, channel_is_first=True)
             image = transforms.functional.resize(image, size=(self.config["image_size"],self.config["image_size"]), interpolation=transforms.InterpolationMode.NEAREST)
 
             inputs[self.data_type] = image
@@ -85,7 +85,7 @@ def my_collate(batch):
     batch = [x for x in batch if x[1] is not None]
     
     return default_collate(batch)
-    
+
 def predict_tile(PATH, dead_model_path, species_model_path, config):
     #get rgb from HSI path
     HSI_basename = os.path.basename(PATH)
@@ -98,15 +98,28 @@ def predict_tile(PATH, dead_model_path, species_model_path, config):
     crowns = predict_crowns(rgb_path)
     crowns["tile"] = PATH
     
-    #Load Alive/Dead model
-    dead_label, dead_score = predict_dead(crowns=crowns, dead_model_path=dead_model_path, rgb_tile=rgb_path, config=config)
+    #CHM filter
+    if config["CHM_pool"]:
+        CHM_pool = glob.glob(config["CHM_pool"], recursive=True)
+        crowns = postprocess_CHM(crowns, CHM_pool)
+        #Rename column
+        filtered_crowns = crowns[crowns.CHM_height > 3]
+    else:
+        filtered_crowns = crowns
     
-    crowns["dead_label"] = dead_label
-    crowns["dead_score"] = dead_score
+    #Load Alive/Dead model
+    print(filtered_crowns.head())
+    if filtered_crowns.empty:
+        raise ValueError("No crowns left after CHM filter. {}".format(crowns.head(n=10)))
+    
+    dead_label, dead_score = predict_dead(crowns=filtered_crowns, dead_model_path=dead_model_path, rgb_tile=rgb_path, config=config)
+    
+    filtered_crowns["dead_label"] = dead_label
+    filtered_crowns["dead_score"] = dead_score
     
     #Load species model
     m = TreeModel.load_from_checkpoint(species_model_path)
-    trees, features = predict_species(HSI_path=PATH, crowns=crowns, m=m, config=config)
+    trees, features = predict_species(HSI_path=PATH, crowns=filtered_crowns, m=m, config=config)
     
     #Spatial smooth
     trees = smooth(trees=trees, features=features, size=config["neighbor_buffer_size"], alpha=config["neighborhood_strength"])
@@ -118,6 +131,9 @@ def predict_tile(PATH, dead_model_path, species_model_path, config):
     trees.loc[trees.dead_label==1,"spatial_label"] = None
     trees.loc[trees.dead_label==1,"spatial_score"] = None
     
+    #Calculate crown area
+    trees["crown_area"] = crowns.geometry.area
+        
     return trees
 
 def predict_crowns(PATH):
@@ -162,36 +178,14 @@ def predict_species(crowns, HSI_path, m, config):
     
     return df, features
 
-def predict_dead(crowns, rgb_tile, dead_model_path, config):
-    """Given a set of bounding boxes and an RGB tile, predict Alive/Dead binary model"""
+def predict_dead(crowns, dead_model_path, rgb_tile, config):
     dead_model = dead.AliveDead.load_from_checkpoint(dead_model_path)
     ds = on_the_fly_dataset(crowns=crowns, image_path=rgb_tile, config=config,data_type="RGB")
-    data_loader = torch.utils.data.DataLoader(
-        ds,
-        batch_size=config["predict_batch_size"],
-        shuffle=False,
-        num_workers=config["workers"],
-    )
-    if torch.cuda.is_available():
-        dead_model = dead_model.to("cuda")
-        dead_model.eval()
-    
-    gather_predictions = []
-    for batch in data_loader:
-        if torch.cuda.is_available():
-            batch = batch.to("cuda")        
-        with torch.no_grad():
-            predictions = dead_model(batch)
-            predictions = F.softmax(predictions, dim =1)
-        gather_predictions.append(predictions.cpu())
-
-    gather_predictions = np.concatenate(gather_predictions)
-    
-    label = np.argmax(gather_predictions,1)
-    score = np.max(gather_predictions, 1)
+    label, score = dead.predict_dead_dataloader(dead_model, ds, config)
     
     return label, score
-    
+
+
 def smooth(trees, features, size, alpha):
     """Given the results dataframe and feature labels, spatially smooth based on alpha value"""
     trees = gpd.GeoDataFrame(trees, geometry="geometry")    
