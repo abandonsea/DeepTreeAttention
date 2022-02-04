@@ -23,7 +23,7 @@ def filter_data(path, config):
         config: DeepTreeAttention config dict, see config.yml
     """
     field = pd.read_csv(path)
-    field = field[~field.elevation.isnull()]
+    field = field[~field.itcEasting.isnull()]
     field = field[~field.growthForm.isin(["liana","small shrub"])]
     field = field[~field.growthForm.isnull()]
     field = field[~field.plantStatus.isnull()]        
@@ -370,7 +370,7 @@ class TreeData(LightningDataModule):
                 self.comet_logger.experiment.log_parameter("Species after crop generation",len(annotations.taxonID.unique()))
                 self.comet_logger.experiment.log_parameter("Samples after crop generation",annotations.shape[0])
             
-            ##Dead filter
+            #Dead filter
             #dead_label, dead_score = filter_dead_annotations(crowns, config=self.config)
             #crowns["dead_label"] = dead_label
             #crowns["dead_score"] = dead_score
